@@ -1,0 +1,118 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      # Your repo has lib/ and pubspec.yaml but no android/ folder yet.
+      # This generates it (using the name: already in pubspec.yaml) without
+      # touching lib/ or pubspec.yaml at all.
+      - name: Generate missing android/ folder
+        run: |
+          if [ ! -d "android" ]; then
+            flutter create --platforms=android --org com.aster.app .
+          fi
+
+      # Automatically inserts Aster's permissions and services into the
+      # freshly generated AndroidManifest.xml -- no manual editing needed.
+      - name: Patch AndroidManifest.xml
+        run: |
+          python3 << 'PYEOF'
+          import re
+
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path) as f:
+              content = f.read()
+
+          permissions = '''
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+          '''
+
+          services = '''
+              <service
+                  android:name="id.flutter.flutter_background_service.BackgroundService"
+                  android:exported="false"
+                  android:foregroundServiceType="specialUse">
+                  <property
+                      android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                      android:value="personal_assistant_notification_buffer" />
+              </service>
+              <service
+                  android:label="Aster notifications"
+                  android:name="notification.listener.service.NotificationListener"
+                  android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+                  android:exported="true">
+                  <intent-filter>
+                      <action android:name="android.service.notification.NotificationListenerService" />
+                  </intent-filter>
+              </service>
+          '''
+
+          if "RECORD_AUDIO" not in content:
+              content = re.sub(r'(<manifest[^>]*>)', r'\1' + permissions, content, count=1)
+
+          if "NotificationListener" not in content:
+              content = content.replace("</application>", services + "</application>")
+
+          with open(path, "w") as f:
+              f.write(content)
+
+          print("Manifest patched.")
+          PYEOF
+
+      # local_auth (biometric lock) requires MainActivity to extend
+      # FlutterFragmentActivity instead of the default FlutterActivity.
+      - name: Patch MainActivity for biometrics
+        run: |
+          python3 << 'PYEOF'
+          import glob
+
+          matches = glob.glob("android/app/src/main/kotlin/**/MainActivity.kt", recursive=True)
+          if not matches:
+              matches = glob.glob("android/app/src/main/java/**/MainActivity.java", recursive=True)
+
+          for path in matches:
+              with open(path) as f:
+                  content = f.read()
+              if "FlutterFragmentActivity" not in content:
+                  content = content.replace(
+                      "io.flutter.embedding.android.FlutterActivity",
+                      "io.flutter.embedding.android.FlutterFragmentActivity",
+                  )
+                  content = content.replace(": FlutterActivity", ": FlutterFragmentActivity")
+                  content = content.replace("extends FlutterActivity", "extends FlutterFragmentActivity")
+                  with open(path, "w") as f:
+                      f.write(content)
+                  print("Patched", path)
+          PYEOF
+
+      - run: flutter pub get
+      - run: flutter build apk --debug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aster-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
